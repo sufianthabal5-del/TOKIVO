@@ -1,0 +1,22 @@
+# Runs the tokiva encoder worker. install.sh writes a copy of this file to
+# /opt/tokiva-encoder/docker-compose.yml on the encoder box.
+services:
+  encoder:
+    image: ghcr.io/YOUR_GITHUB_USERNAME/tokiva-encoder:${TAG:-latest}
+    container_name: tokiva-encoder
+    # The worker's name (unless WORKER_NAME is set). It must stay the same across
+    # restarts and differ between boxes: install.sh puts the server's name here.
+    hostname: encoder
+    restart: unless-stopped
+    env_file: /opt/tokiva-encoder/.env
+    volumes:
+      # On the box's own disk, not inside the container, so a big source has room.
+      - /opt/tokiva-encoder/work:/work
+      - /opt/tokiva-encoder/state:/state
+    # On stop the worker gives its job back to the queue. That needs a moment.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

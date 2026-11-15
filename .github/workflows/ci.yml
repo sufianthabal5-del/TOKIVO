@@ -1,0 +1,117 @@
+name: ci
+
+# The checks from CONTRIBUTING.md on every pull request and every push to main.
+# No secrets needed: the app is built and smoke tested without a database, and
+# the SQL tests run against a throwaway Postgres that lives only for the job.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the whole history, for the secret scan
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run lint
+      - name: Secret scan of the whole history
+        run: node scripts/check-secrets.mjs --history
+      - run: npm test
+      - run: npm run build
+
+      - name: Smoke test without a database
+        run: |
+          npx next start -p 3123 > next.log 2>&1 &
+          for i in $(seq 60); do curl -fsS http://localhost:3123/api/health >/dev/null && break; sleep 1; done
+          node scripts/smoke.mjs http://localhost:3123 || { cat next.log; exit 1; }
+
+  database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A local Postgres for the SQL tests. The login below only exists inside
+    # this job; it is not a secret.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      # Runs the migrations and the SQL tests in a database the script makes
+      # for itself on this server and drops again at the end.
+      - name: SQL tests
+        run: node scripts/db-test.mjs
+        env:
+          DATABASE_URL: postgresql://postgres@localhost:5432/postgres
+
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - name: Install ffmpeg (for the real encode test)
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ffmpeg
+      - run: npm ci --prefix worker --no-audit --no-fund
+      - run: node --test worker/
+
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Builds both Docker images without pushing them, so a broken Dockerfile
+    # shows up here and not on the release branch.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the app image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ops/app/Dockerfile
+          push: false
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+      - name: Build the encoder image
+        uses: docker/build-push-action@v6
+        with:
+          context: worker
+          file: ops/encoder/Dockerfile
+          push: false
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=encoder
